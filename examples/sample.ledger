@@ -1,0 +1,14 @@
+# A small household ledger: date,amount,category[,note]
+# Money out is negative, money in is positive.
+2026-01-02,2500.00,salary
+2026-01-03,-1200.00,rent
+2026-01-05,-84.20,groceries,weekly shop
+2026-01-12,-61.35,groceries
+2026-01-14,-45.00,transport,monthly pass
+2026-01-20,-12.50,coffee
+2026-02-02,2500.00,salary
+2026-02-03,-1200.00,rent
+2026-02-06,-90.15,groceries
+2026-02-10,-38.75,utilities,electricity
+2026-02-14,-0.60,coffee,refill
+2025-12-28,-25.00,gifts,entered late
