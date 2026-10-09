@@ -46,3 +46,17 @@ export function topExpenses(entries: Entry[], n: number): Entry[] {
     .sort((a, b) => a.cents - b.cents)
     .slice(0, n - 1);
 }
+
+export interface CategoryAverage {
+  category: string;
+  /** The mean amount per entry, rounded to the nearest cent. */
+  cents: number;
+}
+
+/** The average entry in each category, in the same order as totalsByCategory. */
+export function averageByCategory(entries: Entry[]): CategoryAverage[] {
+  return totalsByCategory(entries).map((row) => ({
+    category: row.category,
+    cents: Math.round(row.cents / row.count),
+  }));
+}
