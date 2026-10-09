@@ -1,0 +1,570 @@
+name: "Claude Autocomplete"
+
+# Installed by Ground Control.
+#
+# The other half of the loop beside Claude Repair. Repair answers the reviewer;
+# this one answers the machine. A pull request labelled
+# `autocomplete` whose checks are failing, or which no longer
+# merges into main cleanly, is picked up, fixed and pushed to the
+# same branch — which starts the checks again.
+#
+# The loop stops itself three ways, and each adds `autocomplete:escalated`
+# and says so. After 3 attempts on the same head commit without
+# getting it green: a push that moves the branch on is a new head with a fresh
+# budget, so this cap catches a run that keeps failing to change anything.
+# After 9 rounds on one pull request since the last escalation,
+# whatever the head: that cap catches a run that keeps pushing something new
+# and never gets green. And after any round that pushes nothing: with no push
+# there are no new checks and no new event, so nothing would start it again,
+# and a pull request left red and labelled with nobody told is the worst
+# outcome of all.
+
+on:
+  pull_request:
+    types: [labeled, synchronize, reopened, ready_for_review]
+  check_suite:
+    types: [completed]
+  push:
+    branches: ["main"]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: "Pull request number to finish"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+  checks: read
+  id-token: write
+
+# Keyed on the pull request so events for the same one queue instead of
+# running two sessions against one branch. A push to the default branch has no
+# pull request yet; those runs queue behind each other under one key, so two
+# quick merges cannot both pick the same conflicting pull request.
+concurrency:
+  group: claude-autocomplete-${{ github.event.pull_request.number || github.event.check_suite.pull_requests[0].number || inputs.pr_number || (github.event_name == 'push' && 'default-branch') || github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    # A green check suite is the common case; deciding that here costs no
+    # runner minute. The script below still rules out the rest.
+    if: >-
+      github.event_name != 'check_suite' ||
+      github.event.check_suite.conclusion == 'failure' ||
+      github.event.check_suite.conclusion == 'timed_out'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      should_run: ${{ steps.check.outputs.should_run }}
+      reason: ${{ steps.check.outputs.reason }}
+      pr_number: ${{ steps.check.outputs.pr_number }}
+      head_ref: ${{ steps.check.outputs.head_ref }}
+      base_ref: ${{ steps.check.outputs.base_ref }}
+      head_sha: ${{ steps.check.outputs.head_sha }}
+      conflict: ${{ steps.check.outputs.conflict }}
+      failed_checks: ${{ steps.check.outputs.failed_checks }}
+      title: ${{ steps.check.outputs.title }}
+    steps:
+      # Optional, and worth doing: exchange this job's OIDC token for a
+      # short-lived Ground Control installation token.
+      #
+      # GitHub deliberately raises no workflow events for writes made with
+      # GITHUB_TOKEN. Without this exchange, the pull requests this workflow
+      # opens and the labels it applies will not trigger any of this repo's
+      # other workflows — the review and repair lanes simply never start.
+      #
+      # To turn it on, set the repository variable GROUND_CONTROL_URL to
+      # http://localhost:3000 (Settings → Secrets and variables → Actions → Variables).
+      - name: Get a Ground Control token
+        id: gc-token
+        if: vars.GROUND_CONTROL_URL != ''
+        uses: actions/github-script@v7
+        env:
+          GROUND_CONTROL_URL: ${{ vars.GROUND_CONTROL_URL }}
+        with:
+          script: |
+            const oidc = await core.getIDToken('ground-control');
+            const response = await fetch(process.env.GROUND_CONTROL_URL + '/api/actions-token', {
+              method: 'POST',
+              headers: { authorization: 'Bearer ' + oidc },
+            });
+            if (!response.ok) {
+              core.warning('Ground Control token exchange failed (' + response.status + '). Falling back to GITHUB_TOKEN.');
+              return;
+            }
+            const body = await response.json();
+            core.setSecret(body.token);
+            core.setOutput('token', body.token);
+            core.exportVariable('GH_TOKEN', body.token);
+
+      - name: Use the default token instead
+        if: steps.gc-token.outputs.token == ''
+        run: echo "GH_TOKEN=${{ secrets.GITHUB_TOKEN }}" >> "$GITHUB_ENV"
+
+      - name: Decide whether to run
+        id: check
+        uses: actions/github-script@v7
+        env:
+          INPUT_PR_NUMBER: ${{ inputs.pr_number || '' }}
+        with:
+          github-token: ${{ steps.gc-token.outputs.token || secrets.GITHUB_TOKEN }}
+          script: |
+            const ROUND_CAP = 3;
+            const TOTAL_CAP = 9;
+            const MARKER = '<!-- ground-control:autocomplete-result -->';
+            const ESCALATION_MARKER = '<!-- ground-control:autocomplete-escalation -->';
+            const OPT_IN = 'autocomplete';
+            const ESCALATED = 'autocomplete:escalated';
+            // The job names of every Ground Control workflow. A check run
+            // called one of these is an agent reporting on itself (or a
+            // sibling agent that crashed), never a check in the code to fix.
+            const AGENT_CHECKS = ['prepare', 'autocomplete', 'implement', 'research', 'review', 'repair', 'breakdown', 'promote'];
+
+            // Every exit says why in the log: a workflow that silently decides
+            // to do nothing is the hardest kind to debug from the outside.
+            const skip = (reason) => {
+              core.info('Not running: ' + reason);
+              core.setOutput('should_run', 'false');
+              core.setOutput('reason', reason);
+            };
+            const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+            const sameRepo = (pr) =>
+              Boolean(pr.head.repo) && pr.head.repo.full_name === context.repo.owner + '/' + context.repo.repo;
+
+            let number = 0;
+            let forced = false;
+            let conflictOnly = false;
+
+            if (context.eventName === 'workflow_dispatch') {
+              number = Number(process.env.INPUT_PR_NUMBER);
+              forced = true;
+            } else if (context.eventName === 'pull_request') {
+              number = context.payload.pull_request.number;
+              if (context.payload.action === 'labeled') {
+                // One labeled event per label; only ours means anything here.
+                // Ground Control applies it as an App, so a bot sender is
+                // expected on this path and must not be filtered out.
+                if (context.payload.label && context.payload.label.name !== OPT_IN) {
+                  return skip('a different label was added');
+                }
+              } else {
+                // Its own push must not start it again.
+                if (context.payload.sender && context.payload.sender.type === 'Bot') {
+                  return skip('that push came from a bot');
+                }
+                // A person pushing is not a failure yet — the checks have not
+                // run. Only a conflict is worth looking at on this path.
+                conflictOnly = true;
+              }
+            } else if (context.eventName === 'check_suite') {
+              const suite = context.payload.check_suite;
+              if (suite.conclusion !== 'failure' && suite.conclusion !== 'timed_out') {
+                return skip('the check suite concluded ' + suite.conclusion);
+              }
+              const first = (suite.pull_requests || [])[0];
+              if (!first) return skip('that check suite belongs to no pull request');
+              number = first.number;
+              const suiteRuns = await github.paginate(github.rest.checks.listForSuite, {
+                ...context.repo,
+                check_suite_id: suite.id,
+                per_page: 100,
+              });
+              if (suiteRuns.some((run) => AGENT_CHECKS.includes(run.name))) {
+                return skip('that check suite is an agent workflow, not the code');
+              }
+            } else if (context.eventName === 'push') {
+              // Exactly one pull request per push, on purpose: only one of a
+              // conflicting cluster can merge anyway, so the oldest goes first
+              // and the merge it lands raises the next push for the rest.
+              const open = await github.paginate(github.rest.pulls.list, {
+                ...context.repo,
+                state: 'open',
+                sort: 'created',
+                direction: 'asc',
+                per_page: 100,
+              });
+              const candidates = open.filter((pr) => {
+                const names = pr.labels.map((label) => label.name);
+                return names.includes(OPT_IN) && !names.includes(ESCALATED) && !pr.draft && sameRepo(pr);
+              });
+              for (const candidate of candidates) {
+                let detail = null;
+                for (let attempt = 0; attempt < 3; attempt += 1) {
+                  const got = await github.rest.pulls.get({ ...context.repo, pull_number: candidate.number });
+                  detail = got.data;
+                  if (detail.mergeable !== null) break;
+                  await sleep(3000);
+                }
+                if (detail && detail.mergeable === false) {
+                  number = candidate.number;
+                  break;
+                }
+              }
+              if (!number) return skip('nothing open conflicts with this push');
+              conflictOnly = true;
+            } else {
+              return skip('nothing to do on a ' + context.eventName + ' event');
+            }
+
+            if (!number) return skip('no pull request number was available');
+
+            const { data: pr } = await github.rest.pulls.get({ ...context.repo, pull_number: number });
+            if (pr.state !== 'open') return skip('#' + number + ' is not open');
+            if (pr.draft) return skip('#' + number + ' is a draft');
+            // A fork's branch cannot be pushed to with this token.
+            if (!sameRepo(pr)) return skip('#' + number + ' comes from a fork');
+
+            const labels = pr.labels.map((label) => label.name);
+            if (!labels.includes(OPT_IN) && !forced) return skip('#' + number + ' is not labelled ' + OPT_IN);
+            if (labels.includes(ESCALATED) && !forced) return skip('#' + number + ' has already been escalated');
+
+            // GitHub works `mergeable` out in the background; null means it has
+            // not finished yet, and reading it as "fine" would miss conflicts.
+            let mergeable = pr.mergeable;
+            for (let attempt = 0; attempt < 6 && mergeable === null; attempt += 1) {
+              await sleep(5000);
+              const again = await github.rest.pulls.get({ ...context.repo, pull_number: number });
+              mergeable = again.data.mergeable;
+            }
+            const conflict = mergeable === false;
+
+            // Only the newest run of each check counts: one that failed and was
+            // re-run green is not something to go and fix.
+            const runs = await github.paginate(github.rest.checks.listForRef, {
+              ...context.repo,
+              ref: pr.head.sha,
+              per_page: 100,
+            });
+            const newest = new Map();
+            for (const run of runs) {
+              if (AGENT_CHECKS.includes(run.name)) continue;
+              const seen = newest.get(run.name);
+              const at = new Date(run.started_at || 0).getTime();
+              if (!seen || at >= new Date(seen.started_at || 0).getTime()) newest.set(run.name, run);
+            }
+            const failing = [...newest.values()]
+              .filter((run) => ['failure', 'timed_out', 'cancelled'].includes(run.conclusion))
+              .map((run) => run.name);
+            const failedChecks = failing.join(', ');
+
+            if (conflictOnly && !conflict) return skip('#' + number + ' has no conflict to resolve');
+            if (!conflict && failedChecks === '' && !forced) return skip('nothing to fix on #' + number);
+
+            // A round is one report comment naming this exact head commit, so a
+            // round that pushed something is counted against the new head, not
+            // this one, and starts the budget over.
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              ...context.repo,
+              issue_number: number,
+              per_page: 100,
+            });
+            const rounds = comments.filter(
+              (comment) => (comment.body || '').includes(MARKER) && (comment.body || '').includes(pr.head.sha),
+            ).length;
+            // The backstop: every round since the last escalation, whatever the
+            // head. A run that pushes something new each time and never gets
+            // green would otherwise go on for as long as the checks keep failing.
+            const lastEscalation = comments
+              .filter((comment) => (comment.body || '').includes(ESCALATION_MARKER))
+              .map((comment) => new Date(comment.created_at).getTime())
+              .reduce((latest, at) => Math.max(latest, at), 0);
+            const total = comments.filter(
+              (comment) =>
+                (comment.body || '').includes(MARKER) && new Date(comment.created_at).getTime() > lastEscalation,
+            ).length;
+
+            if ((rounds >= ROUND_CAP || total >= TOTAL_CAP) && !forced) {
+              try {
+                await github.rest.issues.getLabel({ ...context.repo, name: ESCALATED });
+              } catch (error) {
+                if (error.status !== 404) throw error;
+                await github.rest.issues.createLabel({
+                  ...context.repo,
+                  name: ESCALATED,
+                  color: 'b60205',
+                  description: 'An agent loop on this pull request hit its round cap and stopped.',
+                });
+              }
+              await github.rest.issues.addLabels({
+                ...context.repo,
+                issue_number: number,
+                labels: [ESCALATED],
+              });
+              await github.rest.issues.createComment({
+                ...context.repo,
+                issue_number: number,
+                body: [
+                  ESCALATION_MARKER,
+                  rounds >= ROUND_CAP
+                    ? 'Autocomplete tried ' + rounds + ' times on this exact head without getting it green, so it has stopped.'
+                    : 'Autocomplete has run ' + total + ' times on this pull request without getting it green, so it has stopped.',
+                  'Fix it by hand, or remove the ' + ESCALATED + ' label and push to start it again.',
+                ].join('\n'),
+              });
+              return skip(
+                rounds >= ROUND_CAP
+                  ? 'the round cap of ' + ROUND_CAP + ' was reached on this head'
+                  : 'the overall cap of ' + TOTAL_CAP + ' rounds was reached',
+              );
+            }
+
+            core.setOutput('should_run', 'true');
+            core.setOutput('reason', conflict ? 'a merge conflict' : 'failing checks');
+            core.setOutput('pr_number', String(number));
+            core.setOutput('head_ref', pr.head.ref);
+            core.setOutput('base_ref', pr.base.ref);
+            core.setOutput('head_sha', pr.head.sha);
+            core.setOutput('conflict', conflict ? 'true' : 'false');
+            core.setOutput('failed_checks', failedChecks);
+            core.setOutput('title', pr.title);
+
+  autocomplete:
+    needs: prepare
+    if: needs.prepare.outputs.should_run == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      # Optional, and worth doing: exchange this job's OIDC token for a
+      # short-lived Ground Control installation token.
+      #
+      # GitHub deliberately raises no workflow events for writes made with
+      # GITHUB_TOKEN. Without this exchange, the pull requests this workflow
+      # opens and the labels it applies will not trigger any of this repo's
+      # other workflows — the review and repair lanes simply never start.
+      #
+      # To turn it on, set the repository variable GROUND_CONTROL_URL to
+      # http://localhost:3000 (Settings → Secrets and variables → Actions → Variables).
+      - name: Get a Ground Control token
+        id: gc-token
+        if: vars.GROUND_CONTROL_URL != ''
+        uses: actions/github-script@v7
+        env:
+          GROUND_CONTROL_URL: ${{ vars.GROUND_CONTROL_URL }}
+        with:
+          script: |
+            const oidc = await core.getIDToken('ground-control');
+            const response = await fetch(process.env.GROUND_CONTROL_URL + '/api/actions-token', {
+              method: 'POST',
+              headers: { authorization: 'Bearer ' + oidc },
+            });
+            if (!response.ok) {
+              core.warning('Ground Control token exchange failed (' + response.status + '). Falling back to GITHUB_TOKEN.');
+              return;
+            }
+            const body = await response.json();
+            core.setSecret(body.token);
+            core.setOutput('token', body.token);
+            core.exportVariable('GH_TOKEN', body.token);
+
+      - name: Use the default token instead
+        if: steps.gc-token.outputs.token == ''
+        run: echo "GH_TOKEN=${{ secrets.GITHUB_TOKEN }}" >> "$GITHUB_ENV"
+
+      - name: Checkout the pull request branch
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.prepare.outputs.head_ref }}
+          fetch-depth: 0
+          token: ${{ steps.gc-token.outputs.token || secrets.GITHUB_TOKEN }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Start the merge
+        if: needs.prepare.outputs.conflict == 'true'
+        env:
+          BASE_REF: ${{ needs.prepare.outputs.base_ref }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch origin "$BASE_REF"
+          # Left deliberately mid-merge and uncommitted: the conflicted files sit
+          # in the tree with their markers, which is what Claude reads and fixes.
+          git merge --no-ff --no-commit "origin/$BASE_REF" || true
+
+      - name: Collect what the checks printed
+        uses: actions/github-script@v7
+        env:
+          HEAD_SHA: ${{ needs.prepare.outputs.head_sha }}
+          FAILED_CHECKS: ${{ needs.prepare.outputs.failed_checks }}
+        with:
+          github-token: ${{ steps.gc-token.outputs.token || secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs');
+            const LIMIT = 4000;
+            const names = (process.env.FAILED_CHECKS || '')
+              .split(',')
+              .map((name) => name.trim())
+              .filter(Boolean);
+
+            const sections = [];
+            if (names.length === 0) {
+              sections.push('No failing checks. This run is here to finish the merge.');
+            } else {
+              const runs = await github.paginate(github.rest.checks.listForRef, {
+                ...context.repo,
+                ref: process.env.HEAD_SHA,
+                per_page: 100,
+              });
+              sections.push('Failing checks: ' + names.join(', '));
+              for (const name of names) {
+                const run = runs.filter((candidate) => candidate.name === name).pop();
+                if (!run) continue;
+                sections.push('## ' + name);
+                if (run.html_url) sections.push(run.html_url);
+                const output = run.output || {};
+                // Trimmed: a check that printed a megabyte of log is not worth
+                // the context it would cost to read all of it.
+                for (const part of [output.title, output.summary, output.text]) {
+                  if (part) sections.push(String(part).slice(0, LIMIT));
+                }
+              }
+            }
+            fs.writeFileSync('autocomplete-context.md', sections.join('\n\n') + '\n');
+
+      - name: Run Claude
+        id: claude
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          github_token: ${{ steps.gc-token.outputs.token || secrets.GITHUB_TOKEN }}
+          allowed_bots: "gh-ground-control-test-app[bot]"
+          claude_args: "--allowed-tools Read,Glob,Grep,Bash,Write,Edit,MultiEdit"
+          prompt: |
+            Read .github/prompts/ground-control/claude-autocomplete.md and follow it exactly.
+            Pull request #${{ needs.prepare.outputs.pr_number }} — ${{ needs.prepare.outputs.title }}
+            Its base is main.
+            Merge conflict to resolve: ${{ needs.prepare.outputs.conflict }}
+            Failing checks: ${{ needs.prepare.outputs.failed_checks }}
+            autocomplete-context.md holds what those checks printed.
+            Write what you did to autocomplete.md — the first line is used as the commit subject.
+
+      - name: Push the fix
+        id: push
+        if: steps.claude.outcome == 'success'
+        env:
+          HEAD_REF: ${{ needs.prepare.outputs.head_ref }}
+          CONFLICT: ${{ needs.prepare.outputs.conflict }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # A half-resolved merge is worse than none: pushing conflict markers
+          # would break the branch for everyone reading it. Tracked files only,
+          # so an installed dependency carrying a marker in a fixture cannot
+          # refuse a merge that was resolved properly.
+          if [ "$CONFLICT" = "true" ] && git grep -q -E '^(<<<<<<< |>>>>>>> )' -- . ':!autocomplete.md' ':!autocomplete-context.md'; then
+            echo "pushed=false" >> "$GITHUB_OUTPUT"
+            echo "reason=conflict markers are still in the tree" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [ -z "$(git status --porcelain)" ]; then
+            echo "pushed=false" >> "$GITHUB_OUTPUT"
+            echo "reason=nothing changed" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          subject="Autocomplete: finish this pull request"
+          if [ -f autocomplete.md ]; then
+            first=$(head -n 1 autocomplete.md)
+            if [ -n "$first" ]; then subject="Autocomplete: $first"; fi
+          fi
+
+          # The two notes are for the comment below, not for the branch.
+          git add -A -- . ':!autocomplete.md' ':!autocomplete-context.md'
+          if git diff --cached --quiet && [ ! -f .git/MERGE_HEAD ]; then
+            echo "pushed=false" >> "$GITHUB_OUTPUT"
+            echo "reason=nothing to commit" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git commit -m "$subject"
+          git push origin "HEAD:$HEAD_REF"
+          echo "pushed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Report
+        if: always() && steps.claude.outcome == 'success'
+        uses: actions/github-script@v7
+        env:
+          PR_NUMBER: ${{ needs.prepare.outputs.pr_number }}
+          HEAD_SHA: ${{ needs.prepare.outputs.head_sha }}
+          PUSHED: ${{ steps.push.outputs.pushed }}
+          PUSH_REASON: ${{ steps.push.outputs.reason }}
+        with:
+          github-token: ${{ steps.gc-token.outputs.token || secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs');
+            const said = fs.existsSync('autocomplete.md')
+              ? fs.readFileSync('autocomplete.md', 'utf8').trim()
+              : '';
+            const pushed = process.env.PUSHED === 'true';
+            const reason = process.env.PUSH_REASON || '';
+            // The `Head:` line is what the round cap counts. One comment naming
+            // this commit is one attempt at this commit, so this line has to
+            // carry the sha even when nothing was pushed.
+            await github.rest.issues.createComment({
+              ...context.repo,
+              issue_number: Number(process.env.PR_NUMBER),
+              body: [
+                '<!-- ground-control:autocomplete-result -->',
+                'Head: ' + process.env.HEAD_SHA,
+                '',
+                said || 'Claude left no note about what it did.',
+                '',
+                pushed ? 'Pushed a fix.' : 'Nothing was pushed' + (reason ? ' — ' + reason : '') + '.',
+              ].join('\n'),
+            });
+            if (pushed) return;
+
+            // Nothing pushed means nothing will start this loop again: no
+            // push, no new checks, no new event. Left alone the pull request
+            // would sit labelled and red with nobody told. So a round that
+            // changes nothing is a stalemate, and a stalemate is a person's.
+            const ESCALATED = 'autocomplete:escalated';
+            try {
+              await github.rest.issues.getLabel({ ...context.repo, name: ESCALATED });
+            } catch (error) {
+              if (error.status !== 404) throw error;
+              await github.rest.issues.createLabel({
+                ...context.repo,
+                name: ESCALATED,
+                color: 'b60205',
+                description: 'An agent loop on this pull request hit its round cap and stopped.',
+              });
+            }
+            await github.rest.issues.addLabels({
+              ...context.repo,
+              issue_number: Number(process.env.PR_NUMBER),
+              labels: [ESCALATED],
+            });
+            await github.rest.issues.createComment({
+              ...context.repo,
+              issue_number: Number(process.env.PR_NUMBER),
+              body: [
+                '<!-- ground-control:autocomplete-escalation -->',
+                'Autocomplete could not change anything on this head, and nothing else will start it again, so it has stopped.',
+                'Fix it by hand, or remove the ' + ESCALATED + ' label and push to start it again.',
+              ].join('\n'),
+            });
+
+      - name: Say the autocomplete run did not finish
+        if: failure()
+        uses: actions/github-script@v7
+        env:
+          PR_NUMBER: ${{ needs.prepare.outputs.pr_number }}
+        with:
+          github-token: ${{ steps.gc-token.outputs.token || secrets.GITHUB_TOKEN }}
+          script: |
+            // No result marker here on purpose: a run that crashed never tried
+            // anything, so it must not spend a round of the cap.
+            await github.rest.issues.createComment({
+              ...context.repo,
+              issue_number: Number(process.env.PR_NUMBER),
+              body: 'The Claude autocomplete run did not finish, so nothing was pushed to this branch. Re-run the workflow to try again.',
+            });
