@@ -1,0 +1,173 @@
+name: "Claude Review"
+
+# Installed by Ground Control.
+#
+# Reviews every pull request. The review body's FIRST LINE is the verdict —
+# `-APPROVED-` or `-NEEDS-CHANGES-` — which is what Ground Control (and the
+# repair agent, if you install it) reads to decide whether a pull request is
+# waiting on a person.
+#
+# The review is submitted as a COMMENT, never as a blocking rejection: the
+# verdict line carries the meaning, and a human review still decides the merge.
+
+on:
+  pull_request:
+    types: [opened, synchronize, ready_for_review]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: "Pull request number to review"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+  id-token: write
+
+concurrency:
+  group: claude-review-${{ github.event.pull_request.number || inputs.pr_number }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      # Optional, and worth doing: exchange this job's OIDC token for a
+      # short-lived Ground Control installation token.
+      #
+      # GitHub deliberately raises no workflow events for writes made with
+      # GITHUB_TOKEN. Without this exchange, the pull requests this workflow
+      # opens and the labels it applies will not trigger any of this repo's
+      # other workflows — the review and repair lanes simply never start.
+      #
+      # To turn it on, set the repository variable GROUND_CONTROL_URL to
+      # http://localhost:3000 (Settings → Secrets and variables → Actions → Variables).
+      - name: Get a Ground Control token
+        id: gc-token
+        if: vars.GROUND_CONTROL_URL != ''
+        uses: actions/github-script@v7
+        env:
+          GROUND_CONTROL_URL: ${{ vars.GROUND_CONTROL_URL }}
+        with:
+          script: |
+            const oidc = await core.getIDToken('ground-control');
+            const response = await fetch(process.env.GROUND_CONTROL_URL + '/api/actions-token', {
+              method: 'POST',
+              headers: { authorization: 'Bearer ' + oidc },
+            });
+            if (!response.ok) {
+              core.warning('Ground Control token exchange failed (' + response.status + '). Falling back to GITHUB_TOKEN.');
+              return;
+            }
+            const body = await response.json();
+            core.setSecret(body.token);
+            core.setOutput('token', body.token);
+            core.exportVariable('GH_TOKEN', body.token);
+
+      - name: Use the default token instead
+        if: steps.gc-token.outputs.token == ''
+        run: echo "GH_TOKEN=${{ secrets.GITHUB_TOKEN }}" >> "$GITHUB_ENV"
+
+      - name: Resolve the pull request
+        id: pr
+        uses: actions/github-script@v7
+        env:
+          INPUT_PR_NUMBER: ${{ inputs.pr_number || '' }}
+        with:
+          github-token: ${{ steps.gc-token.outputs.token || secrets.GITHUB_TOKEN }}
+          script: |
+            const number = Number(context.payload.pull_request?.number || process.env.INPUT_PR_NUMBER);
+            if (!number) {
+              core.setFailed('No pull request number was available.');
+              return;
+            }
+            const { data: pr } = await github.rest.pulls.get({ ...context.repo, pull_number: number });
+            // Forks do not get a repo token, so there is nothing useful to run.
+            const sameRepo = pr.head.repo?.full_name === context.repo.owner + '/' + context.repo.repo;
+            core.setOutput('number', String(number));
+            core.setOutput('same_repo', sameRepo ? 'true' : 'false');
+            core.setOutput('head_sha', pr.head.sha);
+            core.setOutput('title', pr.title);
+
+      - name: Checkout the merge result
+        if: steps.pr.outputs.same_repo == 'true'
+        uses: actions/checkout@v5
+        with:
+          ref: refs/pull/${{ steps.pr.outputs.number }}/merge
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        if: steps.pr.outputs.same_repo == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Run Claude
+        id: claude
+        if: steps.pr.outputs.same_repo == 'true'
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          github_token: ${{ steps.gc-token.outputs.token || secrets.GITHUB_TOKEN }}
+          allowed_bots: "gh-ground-control-test-app[bot]"
+          prompt: |
+            Read .github/prompts/ground-control/claude-review.md and follow it exactly.
+            Review pull request #${{ steps.pr.outputs.number }} — ${{ steps.pr.outputs.title }}
+            Its base is main; `git diff origin/main...HEAD` is the change under review.
+            Write your review to review.md in the repository root.
+          claude_args: "--allowed-tools Read,Glob,Grep,Bash,Write"
+
+      # A verdict only ever comes from a review that finished. A run that
+      # crashed, or was cancelled by the next push, says so as a plain comment
+      # instead: posting `-NEEDS-CHANGES-` for a run that never read the diff
+      # would start the repair agent against feedback that says nothing, and
+      # burn a round of its cap doing it.
+      - name: Submit the review
+        if: steps.claude.outcome == 'success' && steps.pr.outputs.same_repo == 'true'
+        uses: actions/github-script@v7
+        env:
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+          HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
+        with:
+          github-token: ${{ steps.gc-token.outputs.token || secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs');
+            const APPROVED = '-APPROVED-';
+            const NEEDS_CHANGES = '-NEEDS-CHANGES-';
+
+            let body = fs.existsSync('review.md') ? fs.readFileSync('review.md', 'utf8').trim() : '';
+            if (!body) {
+              core.setFailed('The review run produced no review.');
+              return;
+            }
+            const firstLine = body.split('\n', 1)[0].trim();
+            if (firstLine !== APPROVED && firstLine !== NEEDS_CHANGES) {
+              // The verdict line is the contract. A review that was written but
+              // skipped it is unreadable downstream, so treat it as blocking.
+              body = [NEEDS_CHANGES, '', body].join('\n');
+            }
+
+            await github.rest.pulls.createReview({
+              ...context.repo,
+              pull_number: Number(process.env.PR_NUMBER),
+              commit_id: process.env.HEAD_SHA,
+              event: 'COMMENT',
+              body,
+            });
+
+      - name: Say the review did not finish
+        if: failure() && steps.pr.outputs.same_repo == 'true'
+        uses: actions/github-script@v7
+        env:
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+        with:
+          github-token: ${{ steps.gc-token.outputs.token || secrets.GITHUB_TOKEN }}
+          script: |
+            await github.rest.issues.createComment({
+              ...context.repo,
+              issue_number: Number(process.env.PR_NUMBER),
+              body: 'The Claude review run did not finish, so this pull request has not been reviewed. Nothing is blocking it on that account — re-run the workflow to try again.',
+            });
