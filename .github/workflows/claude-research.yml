@@ -1,0 +1,166 @@
+name: "Claude Research"
+
+# Installed by Ground Control.
+#
+# Label an issue `agent:research` and Claude investigates it — reading the code, not
+# changing it — and posts what it found as a comment. The label is swapped for
+# `agent:researched` when the findings are up.
+
+on:
+  issues:
+    types: [labeled]
+  workflow_dispatch:
+    inputs:
+      issue_number:
+        description: "Issue number to investigate"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+  id-token: write
+
+concurrency:
+  group: claude-research-${{ github.event.issue.number || inputs.issue_number }}
+  cancel-in-progress: false
+
+jobs:
+  research:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    if: github.event_name == 'workflow_dispatch' || github.event.label.name == 'agent:research'
+    steps:
+      # Optional, and worth doing: exchange this job's OIDC token for a
+      # short-lived Ground Control installation token.
+      #
+      # GitHub deliberately raises no workflow events for writes made with
+      # GITHUB_TOKEN. Without this exchange, the pull requests this workflow
+      # opens and the labels it applies will not trigger any of this repo's
+      # other workflows — the review and repair lanes simply never start.
+      #
+      # To turn it on, set the repository variable GROUND_CONTROL_URL to
+      # http://localhost:3000 (Settings → Secrets and variables → Actions → Variables).
+      - name: Get a Ground Control token
+        id: gc-token
+        if: vars.GROUND_CONTROL_URL != ''
+        uses: actions/github-script@v7
+        env:
+          GROUND_CONTROL_URL: ${{ vars.GROUND_CONTROL_URL }}
+        with:
+          script: |
+            const oidc = await core.getIDToken('ground-control');
+            const response = await fetch(process.env.GROUND_CONTROL_URL + '/api/actions-token', {
+              method: 'POST',
+              headers: { authorization: 'Bearer ' + oidc },
+            });
+            if (!response.ok) {
+              core.warning('Ground Control token exchange failed (' + response.status + '). Falling back to GITHUB_TOKEN.');
+              return;
+            }
+            const body = await response.json();
+            core.setSecret(body.token);
+            core.setOutput('token', body.token);
+            core.exportVariable('GH_TOKEN', body.token);
+
+      - name: Use the default token instead
+        if: steps.gc-token.outputs.token == ''
+        run: echo "GH_TOKEN=${{ secrets.GITHUB_TOKEN }}" >> "$GITHUB_ENV"
+
+      - name: Claim the issue
+        id: issue
+        uses: actions/github-script@v7
+        env:
+          INPUT_ISSUE_NUMBER: ${{ inputs.issue_number || '' }}
+        with:
+          github-token: ${{ steps.gc-token.outputs.token || secrets.GITHUB_TOKEN }}
+          script: |
+            const number = Number(context.payload.issue?.number || process.env.INPUT_ISSUE_NUMBER);
+            if (!number) {
+              core.setFailed('No issue number was available.');
+              return;
+            }
+            const { data: issue } = await github.rest.issues.get({ ...context.repo, issue_number: number });
+            core.setOutput('number', String(number));
+            core.setOutput('title', issue.title);
+            core.setOutput('body', issue.body || '');
+            await github.rest.issues.addLabels({
+              ...context.repo,
+              issue_number: number,
+              labels: ['agent:claimed'],
+            });
+
+      - name: Checkout repository
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      # Read-only on purpose: this lane answers questions, it does not change
+      # code. The findings land in research-findings.md, which the next step
+      # posts — so a crashed run leaves no half-written comment behind.
+      - name: Run Claude
+        id: claude
+        uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          github_token: ${{ steps.gc-token.outputs.token || secrets.GITHUB_TOKEN }}
+          allowed_bots: "gh-ground-control-test-app[bot]"
+          prompt: |
+            Read .github/prompts/ground-control/claude-research.md and follow it exactly.
+            The question is issue #${{ steps.issue.outputs.number }} — ${{ steps.issue.outputs.title }}
+            Write your findings to research-findings.md in the repository root.
+          claude_args: "--allowed-tools Read,Glob,Grep,Write,WebFetch"
+
+      - name: Post the findings
+        if: always() && steps.issue.outputs.number != ''
+        uses: actions/github-script@v7
+        env:
+          ISSUE_NUMBER: ${{ steps.issue.outputs.number }}
+          OUTCOME: ${{ steps.claude.outcome }}
+        with:
+          github-token: ${{ steps.gc-token.outputs.token || secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs');
+            const issueNumber = Number(process.env.ISSUE_NUMBER);
+            const findings = fs.existsSync('research-findings.md')
+              ? fs.readFileSync('research-findings.md', 'utf8').trim()
+              : '';
+            const ok = process.env.OUTCOME === 'success' && findings.length > 0;
+            const status = ok
+              ? { status: 'success' }
+              : { status: 'blocked', reason: 'The run finished without producing findings.' };
+
+            for (const name of ['agent:claimed', ok ? 'agent:research' : '']) {
+              if (!name) continue;
+              try {
+                await github.rest.issues.removeLabel({ ...context.repo, issue_number: issueNumber, name });
+              } catch (error) {
+                if (error.status !== 404) throw error;
+              }
+            }
+            if (ok) {
+              await github.rest.issues.addLabels({
+                ...context.repo,
+                issue_number: issueNumber,
+                labels: ['agent:researched'],
+              });
+            }
+
+            await github.rest.issues.createComment({
+              ...context.repo,
+              issue_number: issueNumber,
+              body: [
+                '<!-- ground-control:research-result -->',
+                ok ? findings : status.reason,
+                '',
+                '```json',
+                JSON.stringify(status, null, 2),
+                '```',
+              ].join('\n'),
+            });

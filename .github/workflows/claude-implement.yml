@@ -1,0 +1,181 @@
+name: "Claude Implement"
+
+# Installed by Ground Control.
+#
+# Label an issue `agent:implement` and Claude implements it on a branch and opens a
+# pull request that closes the issue. The issue carries `agent:claimed`
+# while the run is in flight and ends on `agent:pr-opened` or
+# `agent:blocked`.
+
+on:
+  issues:
+    types: [labeled]
+  workflow_dispatch:
+    inputs:
+      issue_number:
+        description: "Issue number to implement"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+  id-token: write
+
+concurrency:
+  group: claude-implement-${{ github.event.issue.number || inputs.issue_number }}
+  cancel-in-progress: false
+
+jobs:
+  implement:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    # GitHub raises one `labeled` event per label, and this workflow labels the
+    # issue itself. Gating on the exact label keeps it from restarting itself.
+    if: github.event_name == 'workflow_dispatch' || github.event.label.name == 'agent:implement'
+    steps:
+      # Optional, and worth doing: exchange this job's OIDC token for a
+      # short-lived Ground Control installation token.
+      #
+      # GitHub deliberately raises no workflow events for writes made with
+      # GITHUB_TOKEN. Without this exchange, the pull requests this workflow
+      # opens and the labels it applies will not trigger any of this repo's
+      # other workflows — the review and repair lanes simply never start.
+      #
+      # To turn it on, set the repository variable GROUND_CONTROL_URL to
+      # http://localhost:3000 (Settings → Secrets and variables → Actions → Variables).
+      - name: Get a Ground Control token
+        id: gc-token
+        if: vars.GROUND_CONTROL_URL != ''
+        uses: actions/github-script@v7
+        env:
+          GROUND_CONTROL_URL: ${{ vars.GROUND_CONTROL_URL }}
+        with:
+          script: |
+            const oidc = await core.getIDToken('ground-control');
+            const response = await fetch(process.env.GROUND_CONTROL_URL + '/api/actions-token', {
+              method: 'POST',
+              headers: { authorization: 'Bearer ' + oidc },
+            });
+            if (!response.ok) {
+              core.warning('Ground Control token exchange failed (' + response.status + '). Falling back to GITHUB_TOKEN.');
+              return;
+            }
+            const body = await response.json();
+            core.setSecret(body.token);
+            core.setOutput('token', body.token);
+            core.exportVariable('GH_TOKEN', body.token);
+
+      - name: Use the default token instead
+        if: steps.gc-token.outputs.token == ''
+        run: echo "GH_TOKEN=${{ secrets.GITHUB_TOKEN }}" >> "$GITHUB_ENV"
+
+      - name: Claim the issue
+        id: issue
+        uses: actions/github-script@v7
+        env:
+          INPUT_ISSUE_NUMBER: ${{ inputs.issue_number || '' }}
+        with:
+          github-token: ${{ steps.gc-token.outputs.token || secrets.GITHUB_TOKEN }}
+          script: |
+            const number = Number(context.payload.issue?.number || process.env.INPUT_ISSUE_NUMBER);
+            if (!number) {
+              core.setFailed('No issue number was available.');
+              return;
+            }
+            const { data: issue } = await github.rest.issues.get({ ...context.repo, issue_number: number });
+            if (issue.pull_request) {
+              core.setFailed('#' + number + ' is a pull request, not an issue.');
+              return;
+            }
+            core.setOutput('number', String(number));
+            core.setOutput('title', issue.title);
+            await github.rest.issues.addLabels({
+              ...context.repo,
+              issue_number: number,
+              labels: ['agent:claimed'],
+            });
+
+      - name: Checkout repository
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          token: ${{ steps.gc-token.outputs.token || secrets.GITHUB_TOKEN }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      # No `claude_args: --allowed-tools` here on purpose: an implementer needs
+      # the full tool set (git, the test runner, gh) to finish anything, so it
+      # runs with the action's default. The research and review templates do
+      # restrict theirs — being unable to write is the point of those lanes.
+      - name: Run Claude
+        id: claude
+        uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          github_token: ${{ steps.gc-token.outputs.token || secrets.GITHUB_TOKEN }}
+          # Ground Control applies the starting label as an App, so the event
+          # that reaches this workflow is bot-initiated and must be allowed.
+          allowed_bots: "gh-ground-control-test-app[bot]"
+          base_branch: "main"
+          branch_prefix: "claude/issue-${{ steps.issue.outputs.number }}-"
+          prompt: |
+            Read .github/prompts/ground-control/claude-implement.md and follow it exactly.
+            Implement issue #${{ steps.issue.outputs.number }} — ${{ steps.issue.outputs.title }}
+
+      - name: Report the result
+        if: always() && steps.issue.outputs.number != ''
+        uses: actions/github-script@v7
+        env:
+          ISSUE_NUMBER: ${{ steps.issue.outputs.number }}
+          OUTCOME: ${{ steps.claude.outcome }}
+        with:
+          github-token: ${{ steps.gc-token.outputs.token || secrets.GITHUB_TOKEN }}
+          script: |
+            const issueNumber = Number(process.env.ISSUE_NUMBER);
+            const open = await github.paginate(github.rest.pulls.list, {
+              ...context.repo,
+              state: 'open',
+              per_page: 100,
+            });
+            const closes = new RegExp('\\bClose[sd]?\\s+#' + issueNumber + '\\b', 'i');
+            const pr = open.find((candidate) => closes.test(candidate.body || ''));
+            const ok = process.env.OUTCOME === 'success' && Boolean(pr);
+
+            const status = { status: ok ? 'success' : 'blocked' };
+            if (pr) status.pr = pr.number;
+            if (!ok) {
+              status.reason = pr
+                ? 'The run failed after opening a pull request; the pull request may be incomplete.'
+                : 'Claude finished without opening a pull request that closes this issue.';
+            }
+
+            for (const name of ['agent:claimed']) {
+              try {
+                await github.rest.issues.removeLabel({ ...context.repo, issue_number: issueNumber, name });
+              } catch (error) {
+                if (error.status !== 404) throw error;
+              }
+            }
+            await github.rest.issues.addLabels({
+              ...context.repo,
+              issue_number: issueNumber,
+              labels: [ok ? 'agent:pr-opened' : 'agent:blocked'],
+            });
+
+            await github.rest.issues.createComment({
+              ...context.repo,
+              issue_number: issueNumber,
+              body: [
+                '<!-- ground-control:implement-result -->',
+                ok ? 'Opened #' + pr.number + ' for this issue.' : status.reason,
+                '',
+                '```json',
+                JSON.stringify(status, null, 2),
+                '```',
+              ].join('\n'),
+            });
