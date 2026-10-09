@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { parseLedger } from "../src/parse.ts";
-import { balance, monthlyTotals, topExpenses, totalsByCategory } from "../src/totals.ts";
+import { averageByCategory, balance, monthlyTotals, topExpenses, totalsByCategory } from "../src/totals.ts";
 
 const ENTRIES = parseLedger(
   [
@@ -41,4 +41,16 @@ test("topExpenses never includes income", () => {
   const top = topExpenses(ENTRIES, 10);
   assert.ok(top.every((entry) => entry.cents < 0));
   assert.equal(top[0].category, "rent");
+});
+
+test("averageByCategory rounds to the nearest cent and keeps the report order", () => {
+  assert.deepEqual(averageByCategory(ENTRIES), [
+    { category: "rent", cents: -120000 },
+    { category: "groceries", cents: -4333 },
+    { category: "salary", cents: 250000 },
+  ]);
+});
+
+test("averageByCategory of nothing is nothing", () => {
+  assert.deepEqual(averageByCategory([]), []);
 });
