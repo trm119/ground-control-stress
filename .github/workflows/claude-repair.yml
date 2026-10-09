@@ -33,7 +33,7 @@ concurrency:
 
 jobs:
   prepare:
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     timeout-minutes: 10
     # Only a blocking review on an opted-in pull request starts a repair.
     if: >-
@@ -162,7 +162,7 @@ jobs:
   repair:
     needs: prepare
     if: needs.prepare.outputs.should_run == 'true'
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     timeout-minutes: 90
     steps:
       # Optional, and worth doing: exchange this job's OIDC token for a

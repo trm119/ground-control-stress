@@ -32,7 +32,7 @@ concurrency:
 
 jobs:
   review:
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     timeout-minutes: 45
     steps:
       # Optional, and worth doing: exchange this job's OIDC token for a
