@@ -116,7 +116,7 @@ jobs:
         id: claude
         uses: anthropics/claude-code-action@v1
         with:
-          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           github_token: ${{ steps.gc-token.outputs.token || secrets.GITHUB_TOKEN }}
           # Ground Control applies the starting label as an App, so the event
           # that reaches this workflow is bot-initiated and must be allowed.
