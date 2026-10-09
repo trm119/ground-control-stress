@@ -33,7 +33,7 @@ concurrency:
 
 jobs:
   promote:
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       # Optional, and worth doing: exchange this job's OIDC token for a
