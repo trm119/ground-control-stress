@@ -1,0 +1,254 @@
+name: "Claude Repair"
+
+# Installed by Ground Control.
+#
+# The other half of the review loop: when a review lands whose first line is
+# `-NEEDS-CHANGES-` on a pull request labelled `autocomplete`,
+# Claude reads the feedback, fixes it and pushes to the same branch — which
+# starts the reviewer again.
+#
+# The loop is bounded. After 4 blocking reviews since the last
+# escalation, it stops, adds `autocomplete:escalated` and says so, rather than
+# spinning on a disagreement it is not going to resolve.
+
+on:
+  pull_request_review:
+    types: [submitted]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: "Pull request number to repair"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+  id-token: write
+
+concurrency:
+  group: claude-repair-${{ github.event.pull_request.number || inputs.pr_number }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # Only a blocking review on an opted-in pull request starts a repair.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (startsWith(github.event.review.body, '-NEEDS-CHANGES-') &&
+       contains(github.event.pull_request.labels.*.name, 'autocomplete'))
+    outputs:
+      should_run: ${{ steps.check.outputs.should_run }}
+      pr_number: ${{ steps.check.outputs.pr_number }}
+      head_ref: ${{ steps.check.outputs.head_ref }}
+      title: ${{ steps.check.outputs.title }}
+    steps:
+      # Optional, and worth doing: exchange this job's OIDC token for a
+      # short-lived Ground Control installation token.
+      #
+      # GitHub deliberately raises no workflow events for writes made with
+      # GITHUB_TOKEN. Without this exchange, the pull requests this workflow
+      # opens and the labels it applies will not trigger any of this repo's
+      # other workflows — the review and repair lanes simply never start.
+      #
+      # To turn it on, set the repository variable GROUND_CONTROL_URL to
+      # http://localhost:3000 (Settings → Secrets and variables → Actions → Variables).
+      - name: Get a Ground Control token
+        id: gc-token
+        if: vars.GROUND_CONTROL_URL != ''
+        uses: actions/github-script@v7
+        env:
+          GROUND_CONTROL_URL: ${{ vars.GROUND_CONTROL_URL }}
+        with:
+          script: |
+            const oidc = await core.getIDToken('ground-control');
+            const response = await fetch(process.env.GROUND_CONTROL_URL + '/api/actions-token', {
+              method: 'POST',
+              headers: { authorization: 'Bearer ' + oidc },
+            });
+            if (!response.ok) {
+              core.warning('Ground Control token exchange failed (' + response.status + '). Falling back to GITHUB_TOKEN.');
+              return;
+            }
+            const body = await response.json();
+            core.setSecret(body.token);
+            core.setOutput('token', body.token);
+            core.exportVariable('GH_TOKEN', body.token);
+
+      - name: Use the default token instead
+        if: steps.gc-token.outputs.token == ''
+        run: echo "GH_TOKEN=${{ secrets.GITHUB_TOKEN }}" >> "$GITHUB_ENV"
+
+      - name: Count the rounds
+        id: check
+        uses: actions/github-script@v7
+        env:
+          INPUT_PR_NUMBER: ${{ inputs.pr_number || '' }}
+        with:
+          github-token: ${{ steps.gc-token.outputs.token || secrets.GITHUB_TOKEN }}
+          script: |
+            const ROUND_CAP = 4;
+            const NEEDS_CHANGES = '-NEEDS-CHANGES-';
+            const ESCALATION_MARKER = '<!-- ground-control:repair-escalation -->';
+
+            const number = Number(context.payload.pull_request?.number || process.env.INPUT_PR_NUMBER);
+            if (!number) {
+              core.setFailed('No pull request number was available.');
+              return;
+            }
+            const { data: pr } = await github.rest.pulls.get({ ...context.repo, pull_number: number });
+            core.setOutput('pr_number', String(number));
+            core.setOutput('head_ref', pr.head.ref);
+            core.setOutput('title', pr.title);
+
+            const labels = new Set(pr.labels.map((label) => label.name));
+            if (!labels.has('autocomplete') || labels.has('autocomplete:escalated')) {
+              core.setOutput('should_run', 'false');
+              return;
+            }
+            if (pr.head.repo?.full_name !== context.repo.owner + '/' + context.repo.repo) {
+              core.setOutput('should_run', 'false');
+              return;
+            }
+
+            // Rounds are counted since the last escalation comment, so a person
+            // who has read the escalation and removed the label gets a fresh
+            // budget rather than an instantly re-escalating pull request.
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              ...context.repo,
+              issue_number: number,
+              per_page: 100,
+            });
+            const lastEscalation = comments
+              .filter((comment) => (comment.body || '').startsWith(ESCALATION_MARKER))
+              .map((comment) => new Date(comment.created_at).getTime())
+              .pop() || 0;
+
+            const reviews = await github.paginate(github.rest.pulls.listReviews, {
+              ...context.repo,
+              pull_number: number,
+              per_page: 100,
+            });
+            const blocking = reviews.filter((review) =>
+              new Date(review.submitted_at || 0).getTime() > lastEscalation &&
+              (review.body || '').trim().startsWith(NEEDS_CHANGES));
+
+            if (blocking.length >= ROUND_CAP) {
+              await github.rest.issues.addLabels({
+                ...context.repo,
+                issue_number: number,
+                labels: ['autocomplete:escalated'],
+              });
+              await github.rest.issues.createComment({
+                ...context.repo,
+                issue_number: number,
+                body: [
+                  ESCALATION_MARKER,
+                  'The review and repair loop has been round ' + blocking.length + ' times without converging, so it has stopped here.',
+                  'A person needs to look at what the reviewer and the author keep disagreeing about.',
+                  '',
+                  'Remove the `autocomplete:escalated` label to give it another ' + ROUND_CAP + ' rounds.',
+                ].join('\n'),
+              });
+              core.setOutput('should_run', 'false');
+              return;
+            }
+
+            core.setOutput('should_run', 'true');
+
+  repair:
+    needs: prepare
+    if: needs.prepare.outputs.should_run == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      # Optional, and worth doing: exchange this job's OIDC token for a
+      # short-lived Ground Control installation token.
+      #
+      # GitHub deliberately raises no workflow events for writes made with
+      # GITHUB_TOKEN. Without this exchange, the pull requests this workflow
+      # opens and the labels it applies will not trigger any of this repo's
+      # other workflows — the review and repair lanes simply never start.
+      #
+      # To turn it on, set the repository variable GROUND_CONTROL_URL to
+      # http://localhost:3000 (Settings → Secrets and variables → Actions → Variables).
+      - name: Get a Ground Control token
+        id: gc-token
+        if: vars.GROUND_CONTROL_URL != ''
+        uses: actions/github-script@v7
+        env:
+          GROUND_CONTROL_URL: ${{ vars.GROUND_CONTROL_URL }}
+        with:
+          script: |
+            const oidc = await core.getIDToken('ground-control');
+            const response = await fetch(process.env.GROUND_CONTROL_URL + '/api/actions-token', {
+              method: 'POST',
+              headers: { authorization: 'Bearer ' + oidc },
+            });
+            if (!response.ok) {
+              core.warning('Ground Control token exchange failed (' + response.status + '). Falling back to GITHUB_TOKEN.');
+              return;
+            }
+            const body = await response.json();
+            core.setSecret(body.token);
+            core.setOutput('token', body.token);
+            core.exportVariable('GH_TOKEN', body.token);
+
+      - name: Use the default token instead
+        if: steps.gc-token.outputs.token == ''
+        run: echo "GH_TOKEN=${{ secrets.GITHUB_TOKEN }}" >> "$GITHUB_ENV"
+
+      - name: Checkout the pull request branch
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.prepare.outputs.head_ref }}
+          fetch-depth: 0
+          token: ${{ steps.gc-token.outputs.token || secrets.GITHUB_TOKEN }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Run Claude
+        id: claude
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          github_token: ${{ steps.gc-token.outputs.token || secrets.GITHUB_TOKEN }}
+          allowed_bots: "gh-ground-control-test-app[bot]"
+          base_branch: "main"
+          branch_prefix: ""
+          prompt: |
+            Read .github/prompts/ground-control/claude-repair.md and follow it exactly.
+            Repair pull request #${{ needs.prepare.outputs.pr_number }} — ${{ needs.prepare.outputs.title }}
+            You are already on its branch: commit and push to it, do not open a new pull request.
+
+      - name: Report the result
+        if: always()
+        uses: actions/github-script@v7
+        env:
+          PR_NUMBER: ${{ needs.prepare.outputs.pr_number }}
+          OUTCOME: ${{ steps.claude.outcome }}
+        with:
+          github-token: ${{ steps.gc-token.outputs.token || secrets.GITHUB_TOKEN }}
+          script: |
+            const ok = process.env.OUTCOME === 'success';
+            const status = ok
+              ? { status: 'success' }
+              : { status: 'blocked', reason: 'The repair run did not finish.' };
+            await github.rest.issues.createComment({
+              ...context.repo,
+              issue_number: Number(process.env.PR_NUMBER),
+              body: [
+                '<!-- ground-control:repair-result -->',
+                ok ? 'Addressed the review feedback and pushed to this branch.' : status.reason,
+                '',
+                '```json',
+                JSON.stringify(status, null, 2),
+                '```',
+              ].join('\n'),
+            });
