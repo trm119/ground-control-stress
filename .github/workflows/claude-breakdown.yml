@@ -35,7 +35,7 @@ concurrency:
 
 jobs:
   prepare:
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     timeout-minutes: 10
     # GitHub raises one `labeled` event per label, and this workflow labels the
     # issue itself. Gating on the exact label keeps it from restarting itself.
@@ -125,7 +125,7 @@ jobs:
   breakdown:
     needs: prepare
     if: needs.prepare.outputs.should_run == 'true'
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
       # Optional, and worth doing: exchange this job's OIDC token for a

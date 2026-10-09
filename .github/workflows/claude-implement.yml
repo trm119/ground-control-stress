@@ -29,7 +29,7 @@ concurrency:
 
 jobs:
   implement:
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     timeout-minutes: 120
     # GitHub raises one `labeled` event per label, and this workflow labels the
     # issue itself. Gating on the exact label keeps it from restarting itself.
