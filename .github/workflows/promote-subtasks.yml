@@ -1,0 +1,182 @@
+name: "Promote Subtasks"
+
+# Installed by Ground Control.
+#
+# A subtask that waits on other issues carries `agent:waiting` and
+# names what it waits for in a `Depends-On:` line. When all of them are closed
+# this takes the waiting label off and adds the implement label, which is what
+# starts the implementer.
+#
+# That last part only works with a Ground Control token: set the repository
+# variable GROUND_CONTROL_URL and the label is applied as the App, so GitHub
+# raises a `labeled` event and the implementer starts. With GITHUB_TOKEN alone
+# GitHub raises no event at all — the label still lands and the comment still
+# appears, but a person has to remove and re-add the label to start anything.
+#
+# It runs on every issue that closes, and once a day as a safety net for an
+# event that was missed.
+
+on:
+  issues:
+    types: [closed]
+  schedule:
+    - cron: "17 5 * * *"
+  workflow_dispatch:
+
+permissions:
+  issues: write
+  id-token: write
+
+concurrency:
+  group: promote-subtasks
+  cancel-in-progress: false
+
+jobs:
+  promote:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      # Optional, and worth doing: exchange this job's OIDC token for a
+      # short-lived Ground Control installation token.
+      #
+      # GitHub deliberately raises no workflow events for writes made with
+      # GITHUB_TOKEN. Without this exchange, the pull requests this workflow
+      # opens and the labels it applies will not trigger any of this repo's
+      # other workflows — the review and repair lanes simply never start.
+      #
+      # To turn it on, set the repository variable GROUND_CONTROL_URL to
+      # http://localhost:3000 (Settings → Secrets and variables → Actions → Variables).
+      - name: Get a Ground Control token
+        id: gc-token
+        if: vars.GROUND_CONTROL_URL != ''
+        uses: actions/github-script@v7
+        env:
+          GROUND_CONTROL_URL: ${{ vars.GROUND_CONTROL_URL }}
+        with:
+          script: |
+            const oidc = await core.getIDToken('ground-control');
+            const response = await fetch(process.env.GROUND_CONTROL_URL + '/api/actions-token', {
+              method: 'POST',
+              headers: { authorization: 'Bearer ' + oidc },
+            });
+            if (!response.ok) {
+              core.warning('Ground Control token exchange failed (' + response.status + '). Falling back to GITHUB_TOKEN.');
+              return;
+            }
+            const body = await response.json();
+            core.setSecret(body.token);
+            core.setOutput('token', body.token);
+            core.exportVariable('GH_TOKEN', body.token);
+
+      - name: Use the default token instead
+        if: steps.gc-token.outputs.token == ''
+        run: echo "GH_TOKEN=${{ secrets.GITHUB_TOKEN }}" >> "$GITHUB_ENV"
+
+      - name: Hand on what is no longer waiting
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ steps.gc-token.outputs.token || secrets.GITHUB_TOKEN }}
+          script: |
+            const WAITING = 'agent:waiting';
+            const MARKER = '<!-- ground-control:promote-result -->';
+            const DEPENDS_ON = /^Depends-On:\s*(.+)$/m;
+
+            const hasLabel = async (name) => {
+              try {
+                await github.rest.issues.getLabel({ ...context.repo, name });
+                return true;
+              } catch (error) {
+                if (error.status !== 404) throw error;
+                return false;
+              }
+            };
+
+            // Whichever implement label this repository already uses: a repo
+            // whose implementer is Codex listens for its own label, and handing
+            // a subtask to a label nothing watches would strand it.
+            let implement = 'agent:implement';
+            if (!(await hasLabel(implement))) {
+              if (await hasLabel('codex:implement')) {
+                implement = 'codex:implement';
+              } else {
+                await github.rest.issues.createLabel({
+                  ...context.repo,
+                  name: implement,
+                  color: '5319e7',
+                  description: 'Hand this issue to an agent to implement.',
+                });
+              }
+            }
+
+            const waiting = await github.paginate(github.rest.issues.listForRepo, {
+              ...context.repo,
+              state: 'open',
+              labels: WAITING,
+              per_page: 100,
+            });
+
+            const promoted = [];
+            for (const issue of waiting) {
+              // listForRepo returns pull requests too.
+              if (issue.pull_request) continue;
+
+              const match = DEPENDS_ON.exec(issue.body || '');
+              if (!match) {
+                core.warning('#' + issue.number + ' carries ' + WAITING + ' but has no Depends-On line; leaving it alone.');
+                continue;
+              }
+              const listed = match[1].trim();
+              const numbers = listed.toLowerCase() === 'none'
+                ? []
+                : (listed.match(/#\d+/g) || []).map((reference) => Number(reference.slice(1)));
+              if (listed.toLowerCase() !== 'none' && numbers.length === 0) {
+                core.warning('#' + issue.number + ' has a Depends-On line nothing can be read out of: ' + listed);
+                continue;
+              }
+
+              let ready = true;
+              for (const number of numbers) {
+                try {
+                  const { data: dependency } = await github.rest.issues.get({
+                    ...context.repo,
+                    issue_number: number,
+                  });
+                  if (dependency.state !== 'closed') {
+                    ready = false;
+                    break;
+                  }
+                } catch (error) {
+                  // A number nobody can find cannot be blocking anything.
+                  if (error.status !== 404) throw error;
+                }
+              }
+              if (!ready) continue;
+
+              try {
+                await github.rest.issues.removeLabel({ ...context.repo, issue_number: issue.number, name: WAITING });
+              } catch (error) {
+                if (error.status !== 404) throw error;
+              }
+              await github.rest.issues.addLabels({
+                ...context.repo,
+                issue_number: issue.number,
+                labels: [implement],
+              });
+              await github.rest.issues.createComment({
+                ...context.repo,
+                issue_number: issue.number,
+                body: [
+                  MARKER,
+                  'The subtasks this waited on are closed, so it has been handed to the implementer.',
+                ].join('\n'),
+              });
+              promoted.push(issue.number);
+            }
+
+            core.summary.addHeading('Promote subtasks', 3);
+            core.summary.addRaw(
+              promoted.length === 0
+                ? 'Nothing was waiting only on closed issues.'
+                : 'Handed to ' + implement + ': ' + promoted.map((number) => '#' + number).join(', '),
+            );
+            await core.summary.write();
