@@ -1,0 +1,355 @@
+name: "Claude Large Issue Breakdown"
+
+# Installed by Ground Control.
+#
+# Label an issue `agent:breakdown` and Claude splits it into subtasks
+# that are each one pull request's worth of work, in the order they have to
+# happen. Every subtask says what it waits for in a `Depends-On:` line.
+#
+# The subtasks that wait for nothing are handed to the implementer at once. The
+# rest carry `agent:waiting` and are handed on by the "Promote
+# Subtasks" workflow as the issues they wait for close — or by a person adding
+# the implement label, if that workflow is not installed.
+#
+# The parent issue ends on `agent:decomposed` with the checklist on it.
+
+on:
+  issues:
+    types: [labeled]
+  workflow_dispatch:
+    inputs:
+      issue_number:
+        description: "Issue number to break down"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+  id-token: write
+
+concurrency:
+  group: claude-breakdown-${{ github.event.issue.number || inputs.issue_number }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # GitHub raises one `labeled` event per label, and this workflow labels the
+    # issue itself. Gating on the exact label keeps it from restarting itself.
+    if: github.event_name == 'workflow_dispatch' || github.event.label.name == 'agent:breakdown'
+    outputs:
+      should_run: ${{ steps.issue.outputs.should_run }}
+      number: ${{ steps.issue.outputs.number }}
+      title: ${{ steps.issue.outputs.title }}
+    steps:
+      # Optional, and worth doing: exchange this job's OIDC token for a
+      # short-lived Ground Control installation token.
+      #
+      # GitHub deliberately raises no workflow events for writes made with
+      # GITHUB_TOKEN. Without this exchange, the pull requests this workflow
+      # opens and the labels it applies will not trigger any of this repo's
+      # other workflows — the review and repair lanes simply never start.
+      #
+      # To turn it on, set the repository variable GROUND_CONTROL_URL to
+      # http://localhost:3000 (Settings → Secrets and variables → Actions → Variables).
+      - name: Get a Ground Control token
+        id: gc-token
+        if: vars.GROUND_CONTROL_URL != ''
+        uses: actions/github-script@v7
+        env:
+          GROUND_CONTROL_URL: ${{ vars.GROUND_CONTROL_URL }}
+        with:
+          script: |
+            const oidc = await core.getIDToken('ground-control');
+            const response = await fetch(process.env.GROUND_CONTROL_URL + '/api/actions-token', {
+              method: 'POST',
+              headers: { authorization: 'Bearer ' + oidc },
+            });
+            if (!response.ok) {
+              core.warning('Ground Control token exchange failed (' + response.status + '). Falling back to GITHUB_TOKEN.');
+              return;
+            }
+            const body = await response.json();
+            core.setSecret(body.token);
+            core.setOutput('token', body.token);
+            core.exportVariable('GH_TOKEN', body.token);
+
+      - name: Use the default token instead
+        if: steps.gc-token.outputs.token == ''
+        run: echo "GH_TOKEN=${{ secrets.GITHUB_TOKEN }}" >> "$GITHUB_ENV"
+
+      - name: Claim the issue
+        id: issue
+        uses: actions/github-script@v7
+        env:
+          INPUT_ISSUE_NUMBER: ${{ inputs.issue_number || '' }}
+        with:
+          github-token: ${{ steps.gc-token.outputs.token || secrets.GITHUB_TOKEN }}
+          script: |
+            const number = Number(context.payload.issue?.number || process.env.INPUT_ISSUE_NUMBER);
+            if (!number) {
+              core.setFailed('No issue number was available.');
+              return;
+            }
+            const { data: issue } = await github.rest.issues.get({ ...context.repo, issue_number: number });
+            if (issue.pull_request) {
+              core.setFailed('#' + number + ' is a pull request, not an issue.');
+              return;
+            }
+
+            const skip = (reason) => {
+              core.info('Not running: ' + reason);
+              core.setOutput('should_run', 'false');
+            };
+            if (issue.state !== 'open') return skip('#' + number + ' is closed');
+
+            const labels = issue.labels.map((label) => (typeof label === 'string' ? label : label.name));
+            // Splitting something already claimed, already split, or stopped for
+            // a person would open a second set of subtasks beside the first.
+            if (labels.includes('agent:claimed')) return skip('#' + number + ' is already claimed');
+            if (labels.includes('agent:decomposed')) return skip('#' + number + ' has already been split');
+            if (labels.includes('agent:blocked')) return skip('#' + number + ' is waiting for a person');
+
+            await github.rest.issues.addLabels({
+              ...context.repo,
+              issue_number: number,
+              labels: ['agent:claimed'],
+            });
+            core.setOutput('should_run', 'true');
+            core.setOutput('number', String(number));
+            core.setOutput('title', issue.title);
+
+  breakdown:
+    needs: prepare
+    if: needs.prepare.outputs.should_run == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      # Optional, and worth doing: exchange this job's OIDC token for a
+      # short-lived Ground Control installation token.
+      #
+      # GitHub deliberately raises no workflow events for writes made with
+      # GITHUB_TOKEN. Without this exchange, the pull requests this workflow
+      # opens and the labels it applies will not trigger any of this repo's
+      # other workflows — the review and repair lanes simply never start.
+      #
+      # To turn it on, set the repository variable GROUND_CONTROL_URL to
+      # http://localhost:3000 (Settings → Secrets and variables → Actions → Variables).
+      - name: Get a Ground Control token
+        id: gc-token
+        if: vars.GROUND_CONTROL_URL != ''
+        uses: actions/github-script@v7
+        env:
+          GROUND_CONTROL_URL: ${{ vars.GROUND_CONTROL_URL }}
+        with:
+          script: |
+            const oidc = await core.getIDToken('ground-control');
+            const response = await fetch(process.env.GROUND_CONTROL_URL + '/api/actions-token', {
+              method: 'POST',
+              headers: { authorization: 'Bearer ' + oidc },
+            });
+            if (!response.ok) {
+              core.warning('Ground Control token exchange failed (' + response.status + '). Falling back to GITHUB_TOKEN.');
+              return;
+            }
+            const body = await response.json();
+            core.setSecret(body.token);
+            core.setOutput('token', body.token);
+            core.exportVariable('GH_TOKEN', body.token);
+
+      - name: Use the default token instead
+        if: steps.gc-token.outputs.token == ''
+        run: echo "GH_TOKEN=${{ secrets.GITHUB_TOKEN }}" >> "$GITHUB_ENV"
+
+      - name: Checkout repository
+        uses: actions/checkout@v5
+        with:
+          ref: "main"
+          fetch-depth: 0
+          token: ${{ steps.gc-token.outputs.token || secrets.GITHUB_TOKEN }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      # Through a file, never through the YAML: an issue body is somebody else's
+      # text and has no business being interpolated into a workflow.
+      - name: Write the issue out
+        uses: actions/github-script@v7
+        env:
+          ISSUE_NUMBER: ${{ needs.prepare.outputs.number }}
+        with:
+          github-token: ${{ steps.gc-token.outputs.token || secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs');
+            const number = Number(process.env.ISSUE_NUMBER);
+            const { data: issue } = await github.rest.issues.get({ ...context.repo, issue_number: number });
+            fs.writeFileSync('issue.md', ['# ' + issue.title, '', issue.body || '(no description)'].join('\n') + '\n');
+
+      - name: Run Claude
+        id: claude
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          github_token: ${{ steps.gc-token.outputs.token || secrets.GITHUB_TOKEN }}
+          allowed_bots: "gh-ground-control-test-app[bot]"
+          claude_args: "--allowed-tools Read,Glob,Grep,Bash,Write"
+          prompt: |
+            Read .github/prompts/ground-control/claude-breakdown.md and follow it exactly.
+            The issue to split is in issue.md — it is #${{ needs.prepare.outputs.number }}, ${{ needs.prepare.outputs.title }}
+            Write breakdown.json in the repository root. Change nothing else.
+
+      - name: Create the subtasks
+        if: steps.claude.outcome == 'success'
+        uses: actions/github-script@v7
+        env:
+          ISSUE_NUMBER: ${{ needs.prepare.outputs.number }}
+        with:
+          github-token: ${{ steps.gc-token.outputs.token || secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs');
+            const parent = Number(process.env.ISSUE_NUMBER);
+            const SUBTASK = 'agent:subtask';
+            const WAITING = 'agent:waiting';
+
+            const raw = fs.existsSync('breakdown.json') ? fs.readFileSync('breakdown.json', 'utf8') : '';
+            let plan = null;
+            try {
+              plan = JSON.parse(raw);
+            } catch (error) {
+              plan = null;
+            }
+            const subtasks = plan && Array.isArray(plan.subtasks) ? plan.subtasks : [];
+            // A subtask may only depend on one written before it, which is what
+            // makes the list an order rather than a graph with a cycle in it.
+            const wellFormed = (task, index) =>
+              Boolean(task) &&
+              typeof task.title === 'string' &&
+              task.title.trim() !== '' &&
+              typeof task.body === 'string' &&
+              (task.dependsOn === undefined ||
+                (Array.isArray(task.dependsOn) &&
+                  task.dependsOn.every((dep) => Number.isInteger(dep) && dep >= 0 && dep < index)));
+            if (subtasks.length < 2 || subtasks.length > 8 || !subtasks.every(wellFormed)) {
+              core.setFailed('breakdown.json does not describe 2 to 8 subtasks in dependency order.');
+              return;
+            }
+
+            const hasLabel = async (name) => {
+              try {
+                await github.rest.issues.getLabel({ ...context.repo, name });
+                return true;
+              } catch (error) {
+                if (error.status !== 404) throw error;
+                return false;
+              }
+            };
+            const ensureLabel = async (name, color, description) => {
+              if (await hasLabel(name)) return;
+              await github.rest.issues.createLabel({ ...context.repo, name, color, description });
+            };
+
+            // Whichever implement label this repository already uses: a repo
+            // whose implementer is Codex listens for its own label, and handing
+            // a subtask to a label nothing watches would strand it.
+            let implement = 'agent:implement';
+            if (!(await hasLabel(implement))) {
+              if (await hasLabel('codex:implement')) {
+                implement = 'codex:implement';
+              } else {
+                await ensureLabel(implement, '5319e7', 'Hand this issue to an agent to implement.');
+              }
+            }
+            await ensureLabel(SUBTASK, 'd4c5f9', 'A subtask an agent split off a larger issue.');
+            await ensureLabel(WAITING, 'fef2c0', 'Waits for the subtasks it depends on to close; handed on automatically.');
+
+            const created = [];
+            for (let index = 0; index < subtasks.length; index += 1) {
+              const task = subtasks[index];
+              const waitsFor = (task.dependsOn || []).map((dep) => created[dep]).filter(Boolean);
+              const trailer = waitsFor.length > 0
+                ? 'Depends-On: ' + waitsFor.map((number) => '#' + number).join(', ')
+                : 'Depends-On: none';
+              const body = [task.body.trim(), '', '---', 'Parent: #' + parent, trailer].join('\n');
+              const labels = [SUBTASK, waitsFor.length > 0 ? WAITING : implement];
+              const subtask = await github.rest.issues.create({
+                ...context.repo,
+                title: task.title.trim(),
+                body,
+                labels,
+              });
+              created.push(subtask.data.number);
+
+              // The sub-issue link is a nicety GitHub may refuse; the trailer is
+              // what everything downstream actually reads.
+              try {
+                await github.request('POST /repos/{owner}/{repo}/issues/{issue_number}/sub_issues', {
+                  ...context.repo,
+                  issue_number: parent,
+                  sub_issue_id: subtask.data.id,
+                  headers: { 'X-GitHub-Api-Version': '2022-11-28' },
+                });
+              } catch (error) {
+                core.warning('Could not link #' + subtask.data.number + ' as a sub-issue: ' + error.message);
+              }
+            }
+
+            try {
+              await github.rest.issues.removeLabel({ ...context.repo, issue_number: parent, name: 'agent:claimed' });
+            } catch (error) {
+              if (error.status !== 404) throw error;
+            }
+            await github.rest.issues.addLabels({
+              ...context.repo,
+              issue_number: parent,
+              labels: ['agent:decomposed'],
+            });
+
+            const checklist = subtasks.map((task, index) => {
+              const waitsFor = (task.dependsOn || []).map((dep) => created[dep]).filter(Boolean);
+              const waits = waitsFor.length > 0
+                ? ' (waits for ' + waitsFor.map((number) => '#' + number).join(', ') + ')'
+                : '';
+              return '- [ ] #' + created[index] + ' ' + task.title.trim() + waits;
+            });
+            await github.rest.issues.createComment({
+              ...context.repo,
+              issue_number: parent,
+              body: [
+                '<!-- ground-control:breakdown-result -->',
+                typeof plan.summary === 'string' && plan.summary.trim() !== ''
+                  ? plan.summary.trim()
+                  : 'This issue was split into the subtasks below.',
+                '',
+                ...checklist,
+              ].join('\n'),
+            });
+
+      - name: Say the breakdown did not finish
+        if: failure()
+        uses: actions/github-script@v7
+        env:
+          ISSUE_NUMBER: ${{ needs.prepare.outputs.number }}
+        with:
+          github-token: ${{ steps.gc-token.outputs.token || secrets.GITHUB_TOKEN }}
+          script: |
+            const number = Number(process.env.ISSUE_NUMBER);
+            try {
+              await github.rest.issues.removeLabel({ ...context.repo, issue_number: number, name: 'agent:claimed' });
+            } catch (error) {
+              if (error.status !== 404) throw error;
+            }
+            await github.rest.issues.addLabels({
+              ...context.repo,
+              issue_number: number,
+              labels: ['agent:blocked'],
+            });
+            await github.rest.issues.createComment({
+              ...context.repo,
+              issue_number: number,
+              body: 'The Claude breakdown run did not finish, so this issue has not been split. Any subtasks it opened before stopping are still there, but this issue has no checklist and nothing was handed on. Re-run the workflow to try again.',
+            });
